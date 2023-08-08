@@ -1,0 +1,499 @@
+import * as btc from '@dip1059/bitcoin';
+import { AdminBtcUtxo, BtcUtxo } from '@prisma/client';
+import {
+  LOG_LEVEL_ERROR,
+  MyLogger,
+  newConsole,
+} from '../../../../libs/log/log.service';
+import {
+  BtcBlock,
+  BtcBlockTx,
+  BtcVin,
+  BtcVout,
+} from '../../../core.services/coin_services/btc/btc.types';
+import {
+  CACHE_KEYS,
+  STATUS_ACTIVE,
+  STATUS_EXPIRED,
+} from '../../../helpers/coreconstants';
+import {
+  redis_client,
+  parseUrlAndGetRPCopts,
+  prisma_client,
+} from '../../../helpers/functions';
+import { NETWORK_BASE_TYPE } from '../../../helpers/network_&_coin_constants';
+import { ResponseModel } from '../../../models/custom/common.response.model';
+import { B_NetworkModel } from '../../../models/db/network.model';
+import { DepositService } from '../../../modules/deposit/deposit.service';
+import { DepositBalanceArgs } from '../../../modules/deposit/dto/deposit.input.dto';
+
+const intervalSec =
+  Number(process.env.NETWORK_BLOCK_FETCH_INTERVAL_IN_SECOND) || 60;
+
+async function processBtcAddressCache(
+  network: B_NetworkModel,
+): Promise<string[]> {
+  let addresses: string[];
+  const cacheAddressData = <string>(
+    await redis_client.get(`${network.slug}:${CACHE_KEYS.WALLET_ADDRESSES}`)
+  );
+  if (!cacheAddressData) {
+    const walletKeys = await prisma_client.walletKey.findMany({
+      where: { network_id: network.id },
+      select: { address: true },
+    });
+    addresses = walletKeys.map((v) => v.address);
+    addresses.length &&
+      (await redis_client.set(
+        `${network.slug}:${CACHE_KEYS.WALLET_ADDRESSES}`,
+        addresses.toString(),
+      ));
+  } else {
+    addresses = cacheAddressData.split(',');
+  }
+
+  return addresses;
+}
+
+async function getInitBlockNumber(
+  network: B_NetworkModel,
+  client: btc.Client,
+): Promise<{ blockNumber: number; currentBlock: number }> {
+  let blockNumber: number;
+  const notifiedBlockData = network.notified_block;
+  const currentBlock = Number(await client.getBlockCount());
+  if (!notifiedBlockData) {
+    blockNumber = currentBlock - network.block_confirmation;
+    await prisma_client.notifiedBlock.create({
+      data: {
+        network_id: network.id,
+        block_number: String(blockNumber),
+      },
+    });
+  } else {
+    blockNumber = Number(network.notified_block.block_number);
+  }
+  return { blockNumber, currentBlock };
+}
+
+async function getNextBlockNumber(
+  client: btc.Client,
+  blockNumber: number,
+  network: B_NetworkModel,
+): Promise<{ blockNumber: number; currentBlock: number }> {
+  const currentBlock = Number(await client.getBlockCount());
+  if (blockNumber == 0) {
+    blockNumber = currentBlock - network.block_confirmation;
+    return { blockNumber, currentBlock };
+  }
+  blockNumber += 1;
+  const shouldCallBlock = currentBlock - network.block_confirmation;
+  if (blockNumber > shouldCallBlock) {
+    blockNumber = shouldCallBlock;
+  }
+  return { blockNumber, currentBlock };
+}
+
+async function processIntervalTime(
+  startTime: number,
+  network_slug: string,
+  blockNumber?: any,
+) {
+  const logger = new MyLogger(`${network_slug}.${LOG_FILES.NOTIFIER}`);
+  const endTime = +new Date();
+  // logger.write(`interval task end: ${new Date().toLocaleString()}`);
+
+  const diffInSec = (endTime - startTime) / 1000;
+  // logger.write(`interval time took: ${diffInSec} sec`);
+  // logger.write(`interval setting: ${intervalSec} sec`);
+
+  if (diffInSec < intervalSec) {
+    const sleepTimeinSec = intervalSec - diffInSec;
+    // logger.write(`interval sleep time needed: ${sleepTimeinSec} sec`);
+    // logger.write(`interval sleep start: ${new Date().toLocaleString()}`);
+    await sleep(sleepTimeinSec * 1000);
+    // logger.write(`interval sleep end: ${new Date().toLocaleString()}`);
+  }
+}
+
+export async function BtcNotifier(network: B_NetworkModel) {
+  const logger = new MyLogger(`${network.slug}.${LOG_FILES.NOTIFIER}`);
+  try {
+    if (network.base_type != NETWORK_BASE_TYPE.BTC) return;
+    let client: btc.Client;
+    let blockNumber = 0;
+    let currentBlock = 0;
+    let prevBlock = 0;
+    let isFirstCall = true;
+    const networkSlug = network.slug;
+    try {
+      client = new btc.Client(parseUrlAndGetRPCopts(network.rpc_url));
+      const initBlockData = await getInitBlockNumber(network, client);
+      blockNumber = initBlockData.blockNumber;
+      currentBlock = initBlockData.currentBlock;
+      prevBlock = blockNumber - 1;
+    } catch (e) {
+      blockNumber = network?.notified_block?.block_number
+        ? Number(network?.notified_block?.block_number)
+        : 0;
+      if (blockNumber) prevBlock = blockNumber - 1;
+      logger.write(e.stack, LOG_LEVEL_ERROR);
+    }
+
+    // let i = 0;
+
+    // setInterval(async () => {
+    while (true) {
+      const startTime = +new Date();
+      try {
+        // logger.write(`interval start: ${new Date().toLocaleString()}`);
+
+        // i += 1;
+        if (!isFirstCall) {
+          network = await prisma_client.network.findFirst({
+            where: { slug: networkSlug, status: STATUS_ACTIVE },
+          });
+          if (!network) {
+            if (isFirstCall) isFirstCall = false;
+            await processIntervalTime(startTime, networkSlug, blockNumber);
+            continue;
+          }
+
+          client = new btc.Client(parseUrlAndGetRPCopts(network.rpc_url));
+          const nextBlockData = await getNextBlockNumber(
+            client,
+            blockNumber,
+            network,
+          );
+          blockNumber = nextBlockData.blockNumber;
+          currentBlock = nextBlockData.currentBlock;
+        }
+        // logger.write(`interval: ${i}`);
+        // logger.write(`currentBlock: ${currentBlock}`);
+        // logger.write(`blockNumber: ${blockNumber}`);
+        // logger.write(`prevBlock: ${prevBlock}`);
+
+        if (prevBlock == blockNumber) {
+          if (isFirstCall) isFirstCall = false;
+          await processIntervalTime(startTime, networkSlug, blockNumber);
+          continue;
+        }
+
+        await prisma_client.notifiedBlock.upsert({
+          where: { network_id: network.id },
+          create: { network_id: network.id, block_number: String(blockNumber) },
+          update: { block_number: String(blockNumber) },
+        });
+
+        if (isFirstCall) isFirstCall = false;
+
+        logger.write(`fetching_block: ${blockNumber}`);
+        await fetchBlockAndProcess(network, blockNumber, client);
+        logger.write(`finished_block: ${blockNumber}`);
+
+        prevBlock = blockNumber;
+
+        await processIntervalTime(startTime, networkSlug, blockNumber);
+        logger.write('\n');
+      } catch (e) {
+        blockNumber = prevBlock;
+        logger.write(e.stack, LOG_LEVEL_ERROR);
+        await processIntervalTime(startTime, networkSlug, blockNumber);
+        logger.write('\n');
+      }
+    }
+    // }, intervalSec * 1000);
+  } catch (e) {
+    logger.write(e.stack, LOG_LEVEL_ERROR);
+  }
+}
+
+export async function fetchBlockAndProcess(
+  network: B_NetworkModel,
+  blockNumber: number,
+  client: btc.Client,
+) {
+  const hash = await client.getBlockHash(blockNumber);
+  const block: BtcBlock = await client.getBlock(hash, 2);
+  await processBlock(network, block);
+}
+
+export async function processBlock(network: B_NetworkModel, block: BtcBlock) {
+  const addresses = await processBtcAddressCache(network);
+  const adminAddresses: string[] =
+    (global?.admin_wallets &&
+      global?.admin_wallets[network.slug] &&
+      global?.admin_wallets[network.slug]) ??
+    [];
+
+  for (let i = 0; i < block.tx.length; i++) {
+    const tx = block.tx[i];
+
+    // deposit
+    for (let j = 0; j < tx.vout.length; j++) {
+      const vout = tx.vout[j];
+      //for user
+      for (let k = 0; k < addresses.length; k++) {
+        await processForDepositFind(
+          network,
+          addresses[k],
+          tx,
+          vout,
+          block.height,
+        );
+      }
+
+      //for admin
+      for (let k = 0; k < adminAddresses.length; k++) {
+        await processForDepositFind(
+          network,
+          adminAddresses[k],
+          tx,
+          vout,
+          block.height,
+          true,
+        );
+      }
+    }
+    //
+
+    //withdrawal
+    for (let j = 0; j < tx.vin.length; j++) {
+      const vin = tx.vin[j];
+      //for user
+      await processForWithdrawalFind(network, tx, vin, block.height, false);
+      //for admin
+      await processForWithdrawalFind(network, tx, vin, block.height);
+    }
+  }
+}
+
+async function processForDepositFind(
+  network: B_NetworkModel,
+  address: string,
+  tx: BtcBlockTx,
+  vout: BtcVout,
+  block_number: number | string,
+  forAdmin = false,
+) {
+  const logger = new MyLogger(`${network.slug}.${LOG_FILES.NOTIFIER}`);
+  const voutAddress = vout.scriptPubKey?.address;
+  if (
+    voutAddress &&
+    voutAddress.toLowerCase() == address.toLowerCase() &&
+    vout.value > 0
+  ) {
+    await saveUtxo(
+      network,
+      address,
+      {
+        txid: tx.txid,
+        vout_index: vout.n,
+        amount: vout.value,
+        block_number: block_number.toString(),
+      },
+      forAdmin,
+    );
+
+    let response: ResponseModel;
+    const depositArgsData: DepositBalanceArgs = {
+      txid: tx.txid,
+      crypto_code: network.native_currency,
+      amount: vout.value,
+      address: address,
+      block_number: block_number,
+      network: network,
+    };
+
+    if (await isChangeDepositAfterWithdrawal(tx.vin[0])) {
+      logger.write(
+        `vin_info: txid=${tx.vin[0].txid} vout_index=${tx.vin[0].vout}  block=${block_number}`,
+      );
+      logger.write(`CHANGE_BALANCE_DEPOSIT: block=${block_number}`);
+    } else {
+      logger.write(`ACTUAL_DEPOSIT: block=${block_number}`);
+      if (!forAdmin) {
+        response = await new DepositService().depositBalanceForUser(
+          depositArgsData,
+        );
+      } else {
+        response = await new DepositService().depositBalanceForAdmin(
+          depositArgsData,
+        );
+      }
+      logger.write(`deposit_service_response: ${JSON.stringify(response)}`);
+    }
+
+    logger.write(`deposit_found: txid=${tx.txid} block=${block_number}`);
+    logger.write(
+      `deposit_info: ${address} <- ${vout.value} ${network.native_currency}  block=${block_number}`,
+    );
+    logger.write(
+      `DEPOSIT_MATCHED_FOR: ${
+        forAdmin ? 'ADMIN' : 'USER'
+      } block=${block_number}`,
+    );
+  }
+}
+
+async function isChangeDepositAfterWithdrawal(vin: BtcVin) {
+  if (!vin || !vin.txid || vin.vout == undefined) return false;
+  const utxo = await prisma_client.btcUtxo.findFirst({
+    where: { txid: vin.txid, vout: vin.vout },
+  });
+  if (utxo) return true;
+  else return false;
+}
+
+async function saveUtxo(
+  network: B_NetworkModel,
+  address: string,
+  data: {
+    txid: string;
+    vout_index: number;
+    amount: number;
+    block_number: string;
+  },
+  forAdmin: boolean,
+): Promise<BtcUtxo | AdminBtcUtxo> {
+  let utxo: BtcUtxo | AdminBtcUtxo;
+  if (!forAdmin) {
+    const walletKey = await prisma_client.walletKey.findFirst({
+      where: {
+        network_id: network.id,
+        address: address,
+      },
+      select: { id: true },
+    });
+    if (!walletKey) return null;
+
+    const createData = { key_id: walletKey.id, ...data, vout: data.vout_index };
+    delete createData.vout_index;
+    utxo = await prisma_client.btcUtxo.upsert({
+      where: { txid_vout: { txid: data.txid, vout: data.vout_index } },
+      create: createData,
+      update: {},
+    });
+  } else {
+    const walletKey = await prisma_client.adminWalletKey.findFirst({
+      where: {
+        network_id: network.id,
+        address: address,
+      },
+      select: { id: true },
+    });
+    if (!walletKey) return null;
+
+    const createData = { key_id: walletKey.id, ...data, vout: data.vout_index };
+    delete createData.vout_index;
+    utxo = await prisma_client.adminBtcUtxo.upsert({
+      where: { txid_vout: { txid: data.txid, vout: data.vout_index } },
+      create: createData,
+      update: {},
+    });
+  }
+  return utxo;
+}
+
+async function processForWithdrawalFind(
+  network: B_NetworkModel,
+  tx: BtcBlockTx,
+  vin: BtcVin,
+  block_number: number,
+  forAdmin = true,
+) {
+  const logger = new MyLogger(`${network.slug}.${LOG_FILES.NOTIFIER}`);
+  if (!vin) newConsole.log('tx: ', JSON.stringify(tx));
+  if (!vin.txid || vin.vout == undefined) {
+    return;
+  }
+
+  const utxo = await getUtxo(network, forAdmin, vin.txid, vin.vout);
+  if (utxo) {
+    logger.write(`withdrawal_found: txid=${tx.txid} block=${block_number}`);
+    logger.write(
+      `withdrawal_vin_info: txid=${vin.txid} vout_index=${vin.vout}  block=${block_number}`,
+    );
+    logger.write(
+      `WITHDRAWAL_MATCHED_FOR: ${
+        forAdmin ? 'ADMIN' : 'USER'
+      }  block=${block_number}`,
+    );
+
+    if (utxo.status == STATUS_ACTIVE) {
+      await updateUtxo(utxo, { status: STATUS_EXPIRED }, forAdmin);
+    }
+  }
+}
+
+async function getUtxo(
+  network: B_NetworkModel,
+  forAdmin: boolean,
+  txid: string,
+  vout?: number,
+  address?: string,
+): Promise<BtcUtxo | AdminBtcUtxo> {
+  if (!txid || (vout == undefined && !address)) return null;
+  let utxo: BtcUtxo | AdminBtcUtxo;
+  if (!forAdmin) {
+    let walletKey: { id: bigint };
+    if (address) {
+      walletKey = await prisma_client.walletKey.findFirst({
+        where: {
+          network_id: network.id,
+          address: address,
+        },
+        select: { id: true },
+      });
+      if (!walletKey) return null;
+    }
+
+    utxo = await prisma_client.btcUtxo.findFirst({
+      where: {
+        txid: txid,
+        key_id: walletKey?.id || undefined,
+        vout: vout ?? undefined,
+      },
+    });
+  } else {
+    let walletKey: { id: number };
+    if (address) {
+      walletKey = await prisma_client.adminWalletKey.findFirst({
+        where: {
+          network_id: network.id,
+          address: address,
+        },
+        select: { id: true },
+      });
+      if (!walletKey) return null;
+    }
+
+    utxo = await prisma_client.adminBtcUtxo.findFirst({
+      where: {
+        txid: txid,
+        key_id: walletKey?.id || undefined,
+        vout: vout ?? undefined,
+      },
+    });
+  }
+  return utxo;
+}
+
+async function updateUtxo(
+  utxo: BtcUtxo | AdminBtcUtxo,
+  data: any,
+  forAdmin: boolean,
+): Promise<BtcUtxo | AdminBtcUtxo> {
+  if (!forAdmin) {
+    utxo = await prisma_client.btcUtxo.update({
+      where: { id: utxo.id },
+      data: data,
+    });
+  } else {
+    utxo = await prisma_client.adminBtcUtxo.update({
+      where: { id: utxo.id },
+      data: data,
+    });
+  }
+  return utxo;
+}

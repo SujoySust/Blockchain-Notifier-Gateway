@@ -1,0 +1,169 @@
+generator client {
+  provider = "prisma-client-js"
+  // previewFeatures = ["interactiveTransactions"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Setting {
+  id            Int     @id @default(autoincrement())
+  option_group  String? @db.VarChar(255)
+  option_key    String  @unique @db.VarChar(255)
+  option_value  String? @db.Text
+  value_type    Int     @default(1) @db.SmallInt
+  client_access Int     @default(1) @db.SmallInt
+
+  @@map("settings")
+}
+
+model User {
+  id         BigInt      @id @default(autoincrement())
+  usercode   String      @unique @db.VarChar(100)
+  name       String?     @db.VarChar(255)
+  email      String?     @unique()
+  password   String?     @db.VarChar(255)
+  status     Int         @default(0) @db.SmallInt
+  created_at DateTime    @default(now())
+  updated_at DateTime?   @updatedAt
+  wallet_key  WalletKey[]
+  wallet     Wallet[]
+
+  @@map("users")
+}
+
+model Network {
+  id                 Int       @id @default(autoincrement())
+  name               String    @unique @db.VarChar(255)
+  description        String?   @db.Text
+  slug               String    @unique @db.VarChar(255)
+  native_currency    String    @db.VarChar(20)
+  block_confirmation Int       @default(2) @db.SmallInt
+  base_type          Int       @db.SmallInt // btc base, eth base etc...
+  rpc_url            String?   @db.VarChar(255)
+  wss_url            String?   @db.VarChar(255)
+  explorer_url       String?   @db.VarChar(255)
+  chain_id           String?   @db.VarChar(255)
+  logo               String?   @db.VarChar(255)
+  status             Int       @default(1) @db.SmallInt
+  created_at         DateTime? @default(now())
+  updated_at         DateTime? @updatedAt
+
+  coins            Coin[]
+  user_wallet_keys WalletKey[]
+
+  @@map("networks")
+}
+
+model CryptoCurrency {
+  id         Int       @id @default(autoincrement())
+  name       String    @unique @db.VarChar(255)
+  code       String    @unique @db.VarChar(20)
+  symbol     String?   @db.VarChar(255)
+  decimal    Int       @db.SmallInt
+  logo       String?   @db.VarChar(255)
+  usd_rate   Decimal   @default(0) @db.Decimal(29, 8)
+  status     Int       @db.SmallInt
+  created_at DateTime? @default(now())
+  updated_at DateTime? @updatedAt
+
+  coins   Coin[]
+  wallets Wallet[]
+
+  @@map("crypto_currencies")
+}
+
+model Coin {
+  id               Int     @id @default(autoincrement())
+  uid              String  @unique @default(cuid()) @db.VarChar(40)
+  network_id       Int
+  crypto_id        Int
+  type             Int     @db.SmallInt //Native or Token
+  contract_address String? @db.VarChar(255)
+  decimal          Int     @db.SmallInt
+
+  status     Int       @default(0) @db.SmallInt
+  created_at DateTime? @default(now())
+  updated_at DateTime? @updatedAt
+
+  network  Network        @relation(fields: [network_id], references: [id])
+  currency CryptoCurrency @relation(fields: [crypto_id], references: [id])
+
+  @@unique([network_id, crypto_id])
+  @@unique([network_id, contract_address])
+  @@map("coins")
+}
+
+model WalletKey {
+  id         BigInt @id @default(autoincrement())
+  uid        String @unique @default(cuid()) @db.VarChar(40)
+  user_id    BigInt
+  network_id Int
+  address    String @db.VarChar(255)
+  pv         String @db.VarChar(500)
+  status     Int    @default(1) @db.SmallInt
+
+  user    User    @relation(fields: [user_id], references: [id])
+  network Network @relation(fields: [network_id], references: [id])
+
+  @@unique([user_id, network_id])
+  @@map("wallet_keys")
+}
+
+model Wallet {
+  id                        BigInt    @id @default(autoincrement())
+  user_id                   BigInt
+  crypto_id                 Int?
+  balance                   Decimal   @default(0) @db.Decimal(29, 18)
+  status                    Int       @default(1) @db.SmallInt
+  created_at                DateTime  @default(now())
+  updated_at                DateTime? @updatedAt
+
+  user   User            @relation(fields: [user_id], references: [id])
+  crypto CryptoCurrency? @relation(fields: [crypto_id], references: [id])
+
+  @@unique([user_id, crypto_id])
+  @@map("wallets")
+}
+
+model TxNonce {
+  id             Int       @id @default(autoincrement()) @db.SmallInt
+  network_id     Int
+  wallet_address String    @db.VarChar(255)
+  nonce          String    @default("0") @db.VarChar(255)
+  created_at     DateTime  @default(now())
+  updated_at     DateTime? @updatedAt
+
+  @@unique([network_id, wallet_address])
+  @@map("tx_nonces")
+}
+
+model BtcUtxo {
+  id           String    @unique @default(cuid()) @db.VarChar(255)
+  key_id       BigInt
+  block_number String    @db.VarChar(255)
+  txid         String    @db.VarChar(255)
+  amount       Decimal   @db.Decimal(29, 18)
+  vout         Int       @db.SmallInt
+  status       Int       @default(1) @db.SmallInt
+  created_at   DateTime  @default(now())
+  updated_at   DateTime? @updatedAt
+
+  @@unique([key_id, txid, vout])
+  @@map("btc_utxos")
+}
+
+
+//** Testings **//
+
+// model TestDb {
+//   id              BigInt    @id @default(autoincrement())
+//   // user_id         BigInt    @unique
+//   balance         Decimal   @db.Decimal(29,18)
+//   created_at      DateTime  @default(now())
+//   updated_at      DateTime? @updatedAt
+
+//   @@map("test_db")
+// }
